@@ -92,10 +92,20 @@
     .anim-squash { animation: squash 0.4s ease-in-out; }
     .anim-shake { animation: shake 0.3s ease-in-out 3; }
 
+    /* 咀嚼(觅食用):用户素材到位前用 CSS 占位,
+       素材到位后可删除本段,改由 PNG 帧序列接管 */
+    @keyframes chew {
+      0%, 100% { transform: scaleY(0.82); }
+      50%      { transform: scaleY(1.12); }
+    }
+    #roach-anim-wrap.anim-chew {
+      animation: chew 0.22s ease-in-out infinite;
+    }
+
     /* 对话气泡 */
     #bubble {
       position: absolute;
-      top: 8px;
+      top: 102px;
       left: 50%;
       transform: translateX(-50%);
       background: #fff;
@@ -134,6 +144,23 @@
       border: 7px solid transparent;
       border-top-color: #333;
     }
+
+    /* 觅食调试:目标图标位置标记点 */
+    #target-dot {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: rgba(255, 50, 50, 0.7);
+      border: 2px solid rgba(255, 0, 0, 0.9);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      display: none;
+      z-index: 20;
+    }
+    #target-dot.show { display: block; }
   </style>
 </head>
 
@@ -149,6 +176,8 @@
       </div>
     </div>
   </div>
+  <!-- 觅食调试:目标图标位置标记(红点) -->
+  <div id="target-dot"></div>
 
   <script>
     const { ipcRenderer } = require('electron')
@@ -175,7 +204,29 @@
       },
       // 旋转:把 crawlAngle(rad) 映射成图像旋转角度
       // 默认 sprite 朝右 → rotation = crawlAngle 转 deg;若 sprite 朝上则改 90,朝左改 180
-      rotate: { offsetDeg: 180 }
+      rotate: { offsetDeg: 180 },
+      // 觅食 / 咀嚼配置
+      chew: {
+        prefix: 'material/frameAnimation-chew/frame-', // 帧文件前缀
+        start: 2,          // 起始编号(配合视频抽帧的 frame-002 起算)
+        count: 9,          // 帧数:frame-002 ~ frame-010
+        pad: 3,            // 编号补零位数
+        ext: '.png',
+        fps: 10,           // 咀嚼节奏(帧/秒)
+        duration: 900,     // 一次咀嚼持续 ms(9 帧 * 100ms 正好跑一遍)
+        reachDist: 10,    // 蟑螂距图标多近(px)开始吃
+        huntSpeedMul: 0.45, // 觅食时速度倍数(相对 baseSpeed),慢悠悠找吃的
+        cooldownSec: 60,            // 吃完一个后的基础冷却(秒)
+        cooldownJitterSec: [0, 30], // 冷却再加 0~30 秒随机,避免节奏机械
+        // 视觉对齐:用"蟑螂图像中心 ↔ 图标中心"判断距离,而不是 anchor 左上角对图标左上角
+        roachCenterX: 0.5,   // 蟑螂视觉中心在 pet-anchor 内的水平比例
+        roachCenterY: 0.72,  // 垂直比例(略偏下,上方有气泡预留 60px)
+        iconHalf: 24,        // 图标视觉中心相对 PS 左上角坐标的偏移(逻辑像素)
+        // 如果红点位置和实际图标有偏差,调这两个值
+        posOffsetX: 0,       // 图标坐标水平微调(逻辑像素)
+        posOffsetY: 0,       // 图标坐标垂直微调
+        debugDot: false       // 觅食时显示红点标记目标位置
+      }
     }
 
     const dialogues = [
@@ -205,6 +256,7 @@
     const rotateWrap = document.getElementById('roach-rotate-wrap')
     const bubble = document.getElementById('bubble')
     const roachImg = document.getElementById('roach')
+    const targetDot = document.getElementById('target-dot')
 
     // 预加载所有帧,避免循环时闪烁
     const frameCache = []
@@ -221,8 +273,6 @@
     // 锚点尺寸(随 scale 变化)
     const BASE_W = 200, BASE_H = 260
     let petW = BASE_W, petH = BASE_H
-    // 工作区尺寸(由主进程发来)
-    let boundsW = 0, boundsH = 0
 
     let scale = 1.0
     let isAnimating = false
@@ -254,6 +304,15 @@
     let leftDashActive = 0
     let currentFps = CONFIG.frame.fps
 
+    // 觅食状态(吃桌面快捷方式)
+    let foraging = false       // 觅食模式开关
+    let desktopIcons = []      // [{name,path,x,y}]
+    let targetIcon = null      // 当前奔向的图标
+    let eating = false         // 咀嚼中,冻结爬行与帧切换
+    let eatTimer = 0           // 咀嚼累计 ms
+    let digesting = false      // 消化冷却中,不找新目标
+    let digestTimer = 0        // 冷却剩余秒
+
     function randBetween(a, b) { return a + Math.random() * (b - a) }
     function deg2rad(d) { return d * Math.PI / 180 }
 
@@ -276,8 +335,17 @@
       const t = nowMs / 1000
       const dt = Math.min(t - lastT, 0.05)
       lastT = t
-      const canCrawl = isAutoCrawling && !isDragging && !isAnimating && boundsW > 0
+
+      // 咀嚼中:冻结爬行/帧切换,由 updateChew 单独处理(CSS 或 chew 帧序列)
+      if (eating) {
+        updateChew(dt)
+        requestAnimationFrame(loop)
+        return
+      }
+
+      const canCrawl = isAutoCrawling && !isDragging && !isAnimating && window.innerWidth > 0
       updateCrawl(dt, canCrawl)
+      if (foraging) updateForage(dt)
       updateFrame(dt)
       requestAnimationFrame(loop)
     }
@@ -340,6 +408,7 @@
           crawlAngle = turnFromAngle + (turnToAngle - turnFromAngle) * t
         }
         currentSpeed = target
+        if (foraging && !digesting && targetIcon) currentSpeed *= CONFIG.chew.huntSpeedMul
         moveByAngle(crawlAngle, currentSpeed * dt)
       } else if (crawlState === 'TURNING') {
         currentSpeed = CONFIG.crawl.baseSpeed * 0.4
@@ -373,13 +442,18 @@
     }
 
     function bounceIfNeeded() {
-      if (boundsW <= 0) return
+      const bw = window.innerWidth
+      const bh = window.innerHeight
+      if (bw <= 0) return
       const m = CONFIG.crawl.margin
+      // 用蟑螂视觉中心做边界约束,允许锚点部分越出窗口
+      const cx = petX + petW * CONFIG.chew.roachCenterX
+      const cy = petY + petH * CONFIG.chew.roachCenterY
       let bounced = false
-      if (petX < m) { crawlAngle = Math.PI - crawlAngle; petX = m; bounced = true }
-      else if (petX + petW > boundsW - m) { crawlAngle = Math.PI - crawlAngle; petX = boundsW - m - petW; bounced = true }
-      if (petY < m) { crawlAngle = -crawlAngle; petY = m; bounced = true }
-      else if (petY + petH > boundsH - m) { crawlAngle = -crawlAngle; petY = boundsH - m - petH; bounced = true }
+      if (cx < m) { crawlAngle = Math.PI - crawlAngle; petX = m - petW * CONFIG.chew.roachCenterX; bounced = true }
+      else if (cx > bw - m) { crawlAngle = Math.PI - crawlAngle; petX = bw - m - petW * CONFIG.chew.roachCenterX; bounced = true }
+      if (cy < m) { crawlAngle = -crawlAngle; petY = m - petH * CONFIG.chew.roachCenterY; bounced = true }
+      else if (cy > bh - m) { crawlAngle = -crawlAngle; petY = bh - m - petH * CONFIG.chew.roachCenterY; bounced = true }
       if (bounced) onBoundaryHit()
     }
 
@@ -421,6 +495,113 @@
       const pathSuffix = `${CONFIG.frame.prefix}${num}${CONFIG.frame.ext}`
       if (!roachImg.src.endsWith(pathSuffix)) {
         roachImg.src = pathSuffix
+      }
+    }
+
+    // ========== 觅食:奔向最近桌面图标 ==========
+    async function refreshDesktopIcons() {
+      const r = await ipcRenderer.invoke('get-desktop-icons')
+      desktopIcons = (r && r.ok) ? r.items : []
+      targetIcon = null
+    }
+
+    function updateForage(dt) {
+      if (eating) return
+
+      // 消化冷却:不挑新目标,蟑螂恢复正常随机爬行;倒计时结束后再找下一个
+      if (digesting) {
+        digestTimer -= dt
+        if (digestTimer <= 0) {
+          digesting = false
+          refreshDesktopIcons()   // 异步刷新,期间 desktopIcons 仍是旧的,无所谓
+          if (desktopIcons.length > 0) showBubble('又饿了…')
+        }
+        targetDot.classList.remove('show')
+        return
+      }
+
+      if (desktopIcons.length === 0) { targetDot.classList.remove('show'); return }
+
+      // 无目标时挑最近的(按视觉中心距离)
+      if (!targetIcon) {
+        let best = null, bestD = Infinity
+        const rcx0 = petX + petW * CONFIG.chew.roachCenterX
+        const rcy0 = petY + petH * CONFIG.chew.roachCenterY
+        for (const ic of desktopIcons) {
+          const d = Math.hypot(ic.x + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetX - rcx0,
+                               ic.y + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetY - rcy0)
+          if (d < bestD) { bestD = d; best = ic }
+        }
+        targetIcon = best
+        if (!targetIcon) return
+      }
+
+      // 视觉中心对齐:用蟑螂图像中心 vs 图标中心算方向和距离
+      const rcx = petX + petW * CONFIG.chew.roachCenterX
+      const rcy = petY + petH * CONFIG.chew.roachCenterY
+      const icx = targetIcon.x + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetX
+      const icy = targetIcon.y + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetY
+      const dx = icx - rcx
+      const dy = icy - rcy
+      const dist = Math.hypot(dx, dy)
+
+      // 调试红点:显示蟑螂认为的图标中心位置
+      if (CONFIG.chew.debugDot) {
+        targetDot.classList.add('show')
+        targetDot.style.transform = `translate(${icx}px, ${icy}px)`
+      }
+
+      // 锁定方向朝目标,压制 updateCrawl 内的 jitter/turn/scare/leftDash
+      crawlState = 'CRAWLING'
+      crawlAngle = Math.atan2(dy, dx)
+      turnActive = 0
+      scareTimer = 0
+      leftDashActive = 0
+      updateFacing(crawlAngle)   // 觅食时实时朝向目标,避免咀嚼时方向不对
+
+      if (dist < CONFIG.chew.reachDist) {
+        eating = true
+        eatTimer = 0
+        currentSpeed = 0
+        targetDot.classList.remove('show')
+        // 只有 PNG 帧素材不到位时,才用 CSS 补位动画;素材到位则由 updateChew 切帧
+        if (CONFIG.chew.count === 0) animWrap.classList.add('anim-chew')
+      }
+    }
+
+    // ========== 咀嚼:计时结束后真正吃掉 ==========
+    function updateChew(dt) {
+      eatTimer += dt * 1000
+      if (CONFIG.chew.count > 0) {
+        const interval = 1000 / CONFIG.chew.fps
+        const idx = Math.floor(eatTimer / interval) % CONFIG.chew.count
+        const num = String(CONFIG.chew.start + idx).padStart(CONFIG.chew.pad, '0')
+        const pathSuffix = `${CONFIG.chew.prefix}${num}${CONFIG.chew.ext}`
+        if (!roachImg.src.endsWith(pathSuffix)) roachImg.src = pathSuffix
+      }
+      if (eatTimer >= CONFIG.chew.duration) finishEat()
+    }
+
+    async function finishEat() {
+      animWrap.classList.remove('anim-chew')
+      targetDot.classList.remove('show')
+      const target = targetIcon
+      eating = false
+      eatTimer = 0
+      frameTimer = 0
+      targetIcon = null
+
+      if (!target) return
+      const r = await ipcRenderer.invoke('eat-icon', target.path)
+      if (r && r.ok) {
+        desktopIcons = desktopIcons.filter(i => i.path !== target.path)
+        showBubble('好吃！')
+        // 进入消化冷却:基础 60 秒 + 0~30 秒随机抖动
+        digesting = true
+        digestTimer = CONFIG.chew.cooldownSec +
+                      randBetween.apply(null, CONFIG.chew.cooldownJitterSec)
+      } else {
+        showBubble('啃不动…')
       }
     }
 
@@ -532,6 +713,38 @@
 
     ipcRenderer.on('set-scale', (e, s) => { scale = s; applyScale(); bounceIfNeeded() })
 
+    // ========== 觅食模式开关(主进程右键菜单触发)==========
+    ipcRenderer.on('toggle-foraging', async (e, on) => {
+      foraging = !!on
+      if (foraging) {
+        const r = await ipcRenderer.invoke('get-desktop-icons')
+        desktopIcons = (r && r.ok) ? r.items : []
+        targetIcon = null
+        if (desktopIcons.length === 0) {
+          showBubble('桌上没东西吃…')
+          foraging = false
+        } else {
+          showBubble(`发现 ${desktopIcons.length} 个目标！`)
+        }
+      } else {
+        targetIcon = null
+        desktopIcons = []
+        digesting = false
+        digestTimer = 0
+        targetDot.classList.remove('show')
+        if (eating) {            // 关闭觅食时打断进行中的咀嚼
+          eating = false
+          eatTimer = 0
+          animWrap.classList.remove('anim-chew')
+        }
+      }
+    })
+
+    // ========== 吐出来(主进程右键菜单触发)==========
+    ipcRenderer.on('icon-spit', (e, filename) => {
+      showBubble(`把 ${filename} 吐出来了`)
+    })
+
     // ========== 右键菜单 ==========
     container.addEventListener('contextmenu', (e) => {
       e.preventDefault()
@@ -540,11 +753,9 @@
 
     // ========== 接收屏幕工作区尺寸(作为蟑螂活动边界)==========
     ipcRenderer.on('screen-bounds', (e, b) => {
-      boundsW = b.width
-      boundsH = b.height
-      // 初始位置:屏幕右下角附近
-      petX = boundsW - petW - 50
-      petY = boundsH - petH - 40
+      // 初始位置:屏幕右下角附近,用真实窗口尺寸
+      petX = window.innerWidth - petW - 50
+      petY = window.innerHeight - petH - 40
       crawlAngle = Math.random() * Math.PI * 2
       applyTransform()
     })

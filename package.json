@@ -23,7 +23,11 @@
     "files": [
       "main.js",
       "index.html",
-      "material/**/*"
+      "material/**/*",
+      "scripts/**/*"
+    ],
+    "asarUnpack": [
+      "scripts/**/*"
     ]
   }
 }
