@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* 蟑螂锚点:在大透明窗口里用 transform 移动这一小块就行,
+       窗口本身不动,完全避开 setPosition 导致的 DWM 缩放问题。 */
+    #pet-anchor {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 200px;
+      height: 260px;   /* 200 图 + 60 气泡预留 */
+      transform-origin: 0 0;
+      /* transform 由 JS 设置: translate(petX, petY) */
+    }
+
+    #pet-container {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      cursor: grab;
+    }
+
+    #pet-container:active {
+      cursor: grabbing;
+    }
+
+    /* 三层嵌套,避免 transform 冲突:
+       pet-anchor 承担在屏幕里的位置(translate),
+       anim-wrap 承担跳跃/挤压(CSS transform),
+       rotate-wrap 承担按爬行方向真正旋转(rotate deg) */
+    #roach-anim-wrap {
+      width: 100%;
+      transform-origin: center bottom;
+      user-select: none;
+    }
+
+    #roach-rotate-wrap {
+      width: 100%;
+      /* transform 由 JS 设置: rotate(deg) */
+    }
+
+    #roach {
+      width: 100%;
+      height: auto;
+      display: block;
+      -webkit-user-drag: none;
+      user-select: none;
+      image-rendering: auto;
+    }
+
+    /* 三种点击动画(作用在 anim-wrap) */
+    @keyframes jump {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-35px); }
+    }
+
+    @keyframes squash {
+      0%, 100% { transform: translateX(0); }
+      30% { transform: translateX(-6px); }
+      60% { transform: translateX(6px); }
+    }
+
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-8px); }
+      75% { transform: translateX(8px); }
+    }
+
+    .anim-jump { animation: jump 0.5s ease-out; }
+    .anim-squash { animation: squash 0.4s ease-in-out; }
+    .anim-shake { animation: shake 0.3s ease-in-out 3; }
+
+    /* 对话气泡 */
+    #bubble {
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #fff;
+      border: 2px solid #333;
+      border-radius: 12px;
+      padding: 6px 12px;
+      font-size: 14px;
+      font-family: "微软雅黑", sans-serif;
+      color: #333;
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+      box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.2);
+      z-index: 10;
+    }
+
+    #bubble.show { opacity: 1; }
+
+    #bubble::after {
+      content: '';
+      position: absolute;
+      bottom: -8px;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: #fff;
+    }
+
+    #bubble::before {
+      content: '';
+      position: absolute;
+      bottom: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 7px solid transparent;
+      border-top-color: #333;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- pet-anchor 是屏幕里真实可见的"小桌宠"区域,蟑螂+气泡都装在里面 -->
+  <div id="pet-anchor">
+    <div id="pet-container">
+      <div id="bubble"></div>
+      <div id="roach-anim-wrap">
+        <div id="roach-rotate-wrap">
+          <img id="roach" src="material/frameAnimation-moveBack/001.png" draggable="false">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron')
+
+    // ========== 可调常量(手感都在这里)==========
+    const CONFIG = {
+      frame: { fps: 10, idleIndex: 0, count: 4, prefix: 'material/frameAnimation-moveBack/', pad: 3, ext: '.png' },
+      crawl: {
+        baseSpeed: 120, maxSpeed: 200, margin: 30,
+        crawlingSec: [1.0, 3.5], pausedSec: [10.0, 16.0], turningSec: [0.3, 0.8],
+        jitterEvery: 1.2, jitterChance: 0.20, jitterDeg: 15,
+        scareChancePerSec: 0.05, scareSpeedMul: 2.5, scareSec: [0.6, 1.2], scareTurnDeg: 60,
+        // 随机改向:爬行中每隔一段时间平滑转一个角度
+        turnEvery: [2.0, 5.0],     // 每 2~5 秒改一次方向
+        turnDeltaDeg: [30, 150],   // 每次转 30~150 度
+        turnDurSec: [0.25, 0.5],   // 改向过程持续时长(越短越生硬,越长越柔)
+      },
+      // 朝左冲刺:每隔一段时间自动触发一次,用 moveBack 的 4 帧以更高帧率跑关键帧动画
+      leftDash: {
+        intervalSec: [20, 40],  // 距离下次触发的时间
+        durationSec: [1.0, 2.0],// 每次冲刺持续时长
+        speedMul: 2.0,          // 冲刺速度倍数(相对 baseSpeed)
+        fps: 15,                // 冲刺时关键帧动画帧率
+      },
+      // 旋转:把 crawlAngle(rad) 映射成图像旋转角度
+      // 默认 sprite 朝右 → rotation = crawlAngle 转 deg;若 sprite 朝上则改 90,朝左改 180
+      rotate: { offsetDeg: 180 }
+    }
+
+    const dialogues = [
+      "嘿，别戳我！",
+      "再碰我就叫了啊！",
+      "你好呀人类~",
+      "今天也要加油哦！",
+      "饿了，有吃的吗？",
+      "别盯着我看啦！",
+      "我超可爱的对吧？",
+      "无聊~ 陪我玩会儿",
+      "你点我干嘛？",
+      "跳一个给你看！",
+      "略略略~ 抓不到我",
+      "工作辛苦了！",
+      "蟑螂永不言败！",
+      "摸鱼中...勿扰",
+      "该喝水啦！"
+    ]
+
+    const animClasses = ['anim-jump', 'anim-squash', 'anim-shake']
+
+    // ========== 元素 ==========
+    const petAnchor = document.getElementById('pet-anchor')
+    const container = document.getElementById('pet-container')
+    const animWrap = document.getElementById('roach-anim-wrap')
+    const rotateWrap = document.getElementById('roach-rotate-wrap')
+    const bubble = document.getElementById('bubble')
+    const roachImg = document.getElementById('roach')
+
+    // 预加载所有帧,避免循环时闪烁
+    const frameCache = []
+    for (let i = 1; i <= CONFIG.frame.count; i++) {
+      const num = String(i).padStart(CONFIG.frame.pad, '0')
+      const img = new Image()
+      img.src = `${CONFIG.frame.prefix}${num}${CONFIG.frame.ext}`
+      frameCache.push(img)
+    }
+
+    // ========== 状态 ==========
+    // 蟑螂在窗口里的局部坐标(左上角)。窗口铺满工作区,所以这就是屏幕坐标的相对值。
+    let petX = 0, petY = 0
+    // 锚点尺寸(随 scale 变化)
+    const BASE_W = 200, BASE_H = 260
+    let petW = BASE_W, petH = BASE_H
+    // 工作区尺寸(由主进程发来)
+    let boundsW = 0, boundsH = 0
+
+    let scale = 1.0
+    let isAnimating = false
+    let isAutoCrawling = true
+    let isDragging = false
+    let bubbleTimer = null
+    let crawlResumeTimer = null
+
+    // 点击穿透状态(true=鼠标穿透到桌面,false=接收事件)
+    let passthrough = true
+
+    // 爬行状态
+    let crawlState = 'CRAWLING'
+    let stateTimer = randBetween.apply(null, CONFIG.crawl.crawlingSec)
+    let crawlAngle = 0
+    let turnRateSigned = 0
+    let currentSpeed = 0
+    let scareTimer = 0
+    let jitterTimer = 0
+    let turnTimer = randBetween.apply(null, CONFIG.crawl.turnEvery)
+    let turnActive = 0          // >0 表示正在平滑转向
+    let turnFromAngle = 0
+    let turnToAngle = 0
+    let turnDuration = 0
+    let frameTimer = 0
+    let frameIndex = CONFIG.frame.idleIndex
+    // 朝左冲刺状态
+    let leftDashTimer = randBetween.apply(null, CONFIG.leftDash.intervalSec)
+    let leftDashActive = 0
+    let currentFps = CONFIG.frame.fps
+
+    function randBetween(a, b) { return a + Math.random() * (b - a) }
+    function deg2rad(d) { return d * Math.PI / 180 }
+
+    // ========== 渲染:把 petX/Y 写到 transform ==========
+    function applyTransform() {
+      petAnchor.style.transform = `translate(${petX}px, ${petY}px)`
+    }
+
+    function applyScale() {
+      petW = Math.round(BASE_W * scale)
+      petH = Math.round(BASE_H * scale)
+      petAnchor.style.width = petW + 'px'
+      petAnchor.style.height = petH + 'px'
+      bubble.style.fontSize = Math.round(14 * scale) + 'px'
+    }
+
+    // ========== 主循环:帧动画 + 爬行位移同帧处理 ==========
+    let lastT = performance.now() / 1000
+    function loop(nowMs) {
+      const t = nowMs / 1000
+      const dt = Math.min(t - lastT, 0.05)
+      lastT = t
+      const canCrawl = isAutoCrawling && !isDragging && !isAnimating && boundsW > 0
+      updateCrawl(dt, canCrawl)
+      updateFrame(dt)
+      requestAnimationFrame(loop)
+    }
+    requestAnimationFrame(loop)
+
+    function updateCrawl(dt, canCrawl) {
+      if (!canCrawl) { currentSpeed = 0; currentFps = CONFIG.frame.fps; return }
+
+      // 朝左冲刺(优先级最高)
+      if (leftDashActive > 0) {
+        leftDashActive -= dt
+        crawlAngle = Math.PI
+        currentSpeed = CONFIG.crawl.baseSpeed * CONFIG.leftDash.speedMul
+        currentFps = CONFIG.leftDash.fps
+        moveByAngle(crawlAngle, currentSpeed * dt)
+        return
+      }
+      currentFps = CONFIG.frame.fps
+
+      leftDashTimer -= dt
+      if (leftDashTimer <= 0) {
+        leftDashActive = randBetween.apply(null, CONFIG.leftDash.durationSec)
+        leftDashTimer = randBetween.apply(null, CONFIG.leftDash.intervalSec)
+      }
+
+      stateTimer -= dt
+      if (stateTimer <= 0) transitionState()
+
+      if (crawlState === 'CRAWLING') {
+        let target = CONFIG.crawl.baseSpeed * (0.8 + 0.4 * Math.random())
+        if (scareTimer > 0) {
+          target *= CONFIG.crawl.scareSpeedMul
+          scareTimer -= dt
+        } else if (Math.random() < CONFIG.crawl.scareChancePerSec * dt) {
+          scareTimer = randBetween.apply(null, CONFIG.crawl.scareSec)
+          crawlAngle += deg2rad(CONFIG.crawl.scareTurnDeg) * (Math.random() < 0.5 ? -1 : 1)
+        }
+        jitterTimer -= dt
+        if (jitterTimer <= 0) {
+          jitterTimer = CONFIG.crawl.jitterEvery
+          if (Math.random() < CONFIG.crawl.jitterChance) {
+            crawlAngle += deg2rad(CONFIG.crawl.jitterDeg) * (Math.random() < 0.5 ? -1 : 1)
+          }
+        }
+        // 随机改向:到点开启一次平滑转向(turnActive>0 期间 crawlAngle 从 from 插值到 to,
+        // 蟑螂沿弧线爬过去而不是瞬切)
+        turnTimer -= dt
+        if (turnTimer <= 0 && turnActive <= 0) {
+          turnTimer = randBetween.apply(null, CONFIG.crawl.turnEvery)
+          const delta = randBetween.apply(null, CONFIG.crawl.turnDeltaDeg) * (Math.random() < 0.5 ? -1 : 1)
+          turnFromAngle = crawlAngle
+          turnToAngle = crawlAngle + deg2rad(delta)
+          turnDuration = randBetween.apply(null, CONFIG.crawl.turnDurSec)
+          turnActive = turnDuration
+        }
+        if (turnActive > 0) {
+          turnActive -= dt
+          const tRaw = Math.max(0, Math.min(1, 1 - turnActive / turnDuration))
+          const t = 1 - (1 - tRaw) * (1 - tRaw)   // easeOut,后半段慢下来更自然
+          crawlAngle = turnFromAngle + (turnToAngle - turnFromAngle) * t
+        }
+        currentSpeed = target
+        moveByAngle(crawlAngle, currentSpeed * dt)
+      } else if (crawlState === 'TURNING') {
+        currentSpeed = CONFIG.crawl.baseSpeed * 0.4
+        crawlAngle += turnRateSigned * dt
+        updateFacing(crawlAngle)
+      } else {
+        currentSpeed = 0
+      }
+    }
+
+    function transitionState() {
+      const r = Math.random()
+      if (crawlState === 'CRAWLING') {
+        if (r < 0.20) { crawlState = 'PAUSED'; stateTimer = randBetween.apply(null, CONFIG.crawl.pausedSec) }
+        else if (r < 0.30) { crawlState = 'TURNING'; stateTimer = randBetween.apply(null, CONFIG.crawl.turningSec); turnRateSigned = randBetween(Math.PI, 2 * Math.PI) * (Math.random() < 0.5 ? -1 : 1) }
+        else { crawlState = 'CRAWLING'; stateTimer = randBetween.apply(null, CONFIG.crawl.crawlingSec) }
+      } else {
+        crawlState = 'CRAWLING'; stateTimer = randBetween.apply(null, CONFIG.crawl.crawlingSec)
+      }
+    }
+
+    // 直接改 petX/Y 并刷 transform —— 不再走 IPC/setPosition,DWM 不会被触发
+    function moveByAngle(angle, dist) {
+      const dx = Math.cos(angle) * dist
+      const dy = Math.sin(angle) * dist
+      petX += dx
+      petY += dy
+      applyTransform()
+      bounceIfNeeded()
+      updateFacing(angle)
+    }
+
+    function bounceIfNeeded() {
+      if (boundsW <= 0) return
+      const m = CONFIG.crawl.margin
+      let bounced = false
+      if (petX < m) { crawlAngle = Math.PI - crawlAngle; petX = m; bounced = true }
+      else if (petX + petW > boundsW - m) { crawlAngle = Math.PI - crawlAngle; petX = boundsW - m - petW; bounced = true }
+      if (petY < m) { crawlAngle = -crawlAngle; petY = m; bounced = true }
+      else if (petY + petH > boundsH - m) { crawlAngle = -crawlAngle; petY = boundsH - m - petH; bounced = true }
+      if (bounced) onBoundaryHit()
+    }
+
+    // 撞墙后:要么停下歇一会,要么顺着反弹方向再平滑转一点离开墙边
+    function onBoundaryHit() {
+      leftDashActive = 0       // 取消冲刺,别穿墙
+      turnActive = 0           // 取消进行中的平滑转向,以反弹角度为新起点
+      if (Math.random() < 0.5) {
+        crawlState = 'PAUSED'
+        stateTimer = randBetween(0.8, 2.5)
+        currentSpeed = 0
+      } else {
+        turnFromAngle = crawlAngle
+        turnToAngle = crawlAngle + deg2rad(randBetween(20, 90) * (Math.random() < 0.5 ? -1 : 1))
+        turnDuration = randBetween(0.3, 0.6)
+        turnActive = turnDuration
+      }
+    }
+
+    function updateFacing(angle) {
+      // 按爬行方向真正旋转蟑螂。crawlAngle 在屏幕坐标下:0=右, π/2=下, π=左, -π/2=上
+      const deg = angle * 180 / Math.PI + CONFIG.rotate.offsetDeg
+      rotateWrap.style.transform = `rotate(${deg}deg)`
+    }
+
+    function updateFrame(dt) {
+      if (currentSpeed > 0.01) {
+        frameTimer += dt
+        const interval = 1 / currentFps
+        while (frameTimer >= interval) {
+          frameTimer -= interval
+          frameIndex = (frameIndex + 1) % CONFIG.frame.count
+        }
+      } else {
+        frameTimer = 0
+        frameIndex = CONFIG.frame.idleIndex
+      }
+      const num = String(frameIndex + 1).padStart(CONFIG.frame.pad, '0')
+      const pathSuffix = `${CONFIG.frame.prefix}${num}${CONFIG.frame.ext}`
+      if (!roachImg.src.endsWith(pathSuffix)) {
+        roachImg.src = pathSuffix
+      }
+    }
+
+    // ========== 点击穿透:鼠标进/出蟑螂矩形就切换 ==========
+    function isOverPet(cx, cy) {
+      // 用蟑螂图片的真实矩形(精确到图像本身,不包含上方气泡留白)
+      const r = roachImg.getBoundingClientRect()
+      return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom
+    }
+
+    function setPassthrough(ignore) {
+      if (ignore === passthrough) return
+      passthrough = ignore
+      ipcRenderer.send('set-passthrough', ignore)
+    }
+
+    function updatePassthrough(cx, cy) {
+      // 拖拽期间保持接收事件,否则一旦鼠标越出图片矩形就会丢 mouseup
+      const wantIgnore = isDragging ? false : !isOverPet(cx, cy)
+      setPassthrough(wantIgnore)
+    }
+
+    // forward:true 下,mousemove 即使在穿透时也会被转发进来,正好用来探测边界 + 驱动拖拽
+    document.addEventListener('mousemove', (e) => {
+      // 按住左键 + 移动超过阈值才算拖拽开始
+      if ((e.buttons & 1) && !isDragging &&
+        (Math.abs(e.screenX - downX) > 3 || Math.abs(e.screenY - downY) > 3)) {
+        isDragging = true
+      }
+
+      if (isDragging) {
+        const dx = e.screenX - lastDragX
+        const dy = e.screenY - lastDragY
+        petX += dx
+        petY += dy
+        lastDragX = e.screenX
+        lastDragY = e.screenY
+        applyTransform()
+        bounceIfNeeded()
+      }
+      updatePassthrough(e.clientX, e.clientY)
+    })
+
+    // ========== 拖拽(按下即暂停自主爬行)==========
+    function pauseCrawl() {
+      isAutoCrawling = false
+      if (crawlResumeTimer) { clearTimeout(crawlResumeTimer); crawlResumeTimer = null }
+    }
+    function scheduleResume() {
+      if (crawlResumeTimer) clearTimeout(crawlResumeTimer)
+      crawlResumeTimer = setTimeout(() => { isAutoCrawling = true; crawlResumeTimer = null }, 500)
+    }
+
+    let lastDragX = 0, lastDragY = 0, downX = 0, downY = 0
+    container.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return
+      pauseCrawl()
+      isDragging = false
+      downX = lastDragX = e.screenX
+      downY = lastDragY = e.screenY
+    })
+
+    document.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return
+      if (isDragging) {
+        isDragging = false
+        scheduleResume()
+        updatePassthrough(e.clientX, e.clientY)
+      }
+    })
+
+    // ========== 点击触发互动(只在"按下位置≈抬起位置"时才算点击,过滤掉拖拽)==========
+    container.addEventListener('click', (e) => {
+      if (e.button !== 0) return
+      if (isAnimating) return
+      if (Math.abs(e.screenX - downX) > 3 || Math.abs(e.screenY - downY) > 3) return
+
+      isAnimating = true
+      const randomAnim = animClasses[Math.floor(Math.random() * animClasses.length)]
+      animWrap.classList.remove(...animClasses)
+      void animWrap.offsetWidth
+      animWrap.classList.add(randomAnim)
+
+      showBubble(dialogues[Math.floor(Math.random() * dialogues.length)])
+
+      setTimeout(() => {
+        animWrap.classList.remove(...animClasses)
+        isAnimating = false
+        scheduleResume()
+      }, 500)
+    })
+
+    // ========== 对话气泡 ==========
+    function showBubble(text) {
+      bubble.textContent = text
+      bubble.classList.add('show')
+      clearTimeout(bubbleTimer)
+      bubbleTimer = setTimeout(() => bubble.classList.remove('show'), 2000)
+    }
+
+    // ========== 滚轮缩放 ==========
+    container.addEventListener('wheel', (e) => {
+      e.preventDefault()
+      if (e.deltaY < 0) scale = Math.min(scale * 1.1, 3.0)
+      else scale = Math.max(scale * 0.9, 0.3)
+      applyScale()
+      bounceIfNeeded()
+    })
+
+    ipcRenderer.on('set-scale', (e, s) => { scale = s; applyScale(); bounceIfNeeded() })
+
+    // ========== 右键菜单 ==========
+    container.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      ipcRenderer.send('show-context-menu')
+    })
+
+    // ========== 接收屏幕工作区尺寸(作为蟑螂活动边界)==========
+    ipcRenderer.on('screen-bounds', (e, b) => {
+      boundsW = b.width
+      boundsH = b.height
+      // 初始位置:屏幕右下角附近
+      petX = boundsW - petW - 50
+      petY = boundsH - petH - 40
+      crawlAngle = Math.random() * Math.PI * 2
+      applyTransform()
+    })
+  </script>
+</body>
+
+</html>

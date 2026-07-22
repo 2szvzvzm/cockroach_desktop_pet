@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>视频帧提取 - 逐帧导出</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "微软雅黑", sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      background: #16213e;
+      border-radius: 16px;
+      padding: 30px;
+      max-width: 800px;
+      margin: 0 auto;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    }
+    h1 { text-align: center; margin-bottom: 8px; font-size: 24px; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
+    .section { margin-bottom: 20px; }
+    .section label { display: block; margin-bottom: 6px; color: #aaa; font-size: 13px; }
+    .section input[type="file"] { width: 100%; }
+    .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 120px; }
+    input[type="number"] {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #0f3460;
+      color: #fff;
+      font-size: 14px;
+    }
+    input[type="number"]:focus { outline: none; border-color: #e94560; }
+    button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      background: #e94560;
+      color: #fff;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #c73652; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    .progress-bar {
+      height: 8px;
+      background: #0f3460;
+      border-radius: 4px;
+      margin-top: 12px;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-fill {
+      height: 100%;
+      background: #e94560;
+      width: 0%;
+      transition: width 0.1s;
+    }
+    .status { margin-top: 12px; font-size: 13px; color: #aaa; display: none; }
+    .status span { color: #e94560; font-weight: bold; }
+    #framesGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+      display: none;
+    }
+    #framesGrid.show { display: grid; }
+    .frame-card {
+      background: #0f3460;
+      border-radius: 8px;
+      overflow: hidden;
+      text-align: center;
+    }
+    .frame-card img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    .frame-card .label {
+      padding: 6px;
+      font-size: 12px;
+      color: #aaa;
+    }
+    #downloadAllBtn {
+      display: none;
+      margin-top: 16px;
+      background: #0f3460;
+    }
+    #downloadAllBtn.show { display: block; }
+    #downloadAllBtn:hover { background: #1a4a7a; }
+    .note { font-size: 12px; color: #666; margin-top: 8px; text-align: center; }
+    video { display: none; }
+    canvas { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>视频帧提取 - 逐帧导出</h1>
+    <p class="subtitle">从 MP4 视频中按指定帧率提取每一帧，逐一保存为 PNG</p>
+
+    <div class="section">
+      <label>选择视频文件</label>
+      <input type="file" id="fileInput" accept="video/mp4,video/webm,video/*">
+    </div>
+
+    <div class="row section">
+      <div>
+        <label>每秒提取帧数</label>
+        <input type="number" id="fps" value="8" min="1" max="60">
+      </div>
+      <div>
+        <label>视频原始尺寸</label>
+        <div id="videoInfo" style="padding:8px 12px;background:#0f3460;border-radius:8px;font-size:14px;color:#888;">请先选择视频</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <button id="extractBtn" disabled>提取帧并逐张导出</button>
+      <div class="progress-bar" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+    </div>
+
+    <div class="status" id="status">
+      共提取 <span id="frameCount">0</span> 帧 | 每帧: <span id="frameSize">-</span>
+    </div>
+
+    <button id="downloadAllBtn">下载全部帧 (逐张自动下载)</button>
+
+    <div id="framesGrid"></div>
+
+    <p class="note">所有处理在本地浏览器完成，视频不会上传到任何服务器</p>
+  </div>
+
+  <video id="video" crossorigin="anonymous"></video>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const fileInput = document.getElementById('fileInput')
+    const extractBtn = document.getElementById('extractBtn')
+    const downloadAllBtn = document.getElementById('downloadAllBtn')
+    const progressBar = document.getElementById('progressBar')
+    const progressFill = document.getElementById('progressFill')
+    const status = document.getElementById('status')
+    const framesGrid = document.getElementById('framesGrid')
+    const video = document.getElementById('video')
+    const canvas = document.getElementById('canvas')
+    const ctx = canvas.getContext('2d')
+
+    let videoW = 0, videoH = 0
+    let frameBlobs = []
+    let frameUrls = []
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files[0]
+      if (file) {
+        video.src = URL.createObjectURL(file)
+        video.onloadedmetadata = () => {
+          videoW = video.videoWidth
+          videoH = video.videoHeight
+          document.getElementById('videoInfo').textContent = videoW + ' x ' + videoH
+          document.getElementById('videoInfo').style.color = '#e94560'
+          extractBtn.disabled = false
+        }
+      } else {
+        extractBtn.disabled = true
+        document.getElementById('videoInfo').textContent = '请先选择视频'
+        document.getElementById('videoInfo').style.color = '#888'
+      }
+    })
+
+    extractBtn.addEventListener('click', async () => {
+      const fps = parseInt(document.getElementById('fps').value) || 8
+
+      if (!videoW || !videoH) {
+        alert('请先选择视频文件')
+        return
+      }
+
+      extractBtn.disabled = true
+      extractBtn.textContent = '处理中...'
+      progressBar.style.display = 'block'
+      progressFill.style.width = '0%'
+      status.style.display = 'none'
+      framesGrid.innerHTML = ''
+      framesGrid.classList.remove('show')
+      downloadAllBtn.classList.remove('show')
+
+      frameBlobs = []
+      frameUrls.forEach(u => URL.revokeObjectURL(u))
+      frameUrls = []
+
+      try {
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = resolve
+          video.onerror = reject
+          if (video.readyState >= 1) resolve()
+        })
+
+        const videoDuration = video.duration
+        const interval = 1 / fps
+        const totalFrames = Math.floor(videoDuration / interval)
+
+        if (totalFrames === 0) {
+          alert('视频太短，没有可提取的帧')
+          resetButton()
+          return
+        }
+
+        canvas.width = videoW
+        canvas.height = videoH
+
+        for (let i = 0; i < totalFrames; i++) {
+          const time = i * interval
+          video.currentTime = time
+
+          await new Promise((resolve) => {
+            const onSeeked = () => {
+              video.removeEventListener('seeked', onSeeked)
+              ctx.drawImage(video, 0, 0, videoW, videoH)
+              canvas.toBlob((blob) => {
+                frameBlobs.push(blob)
+                const url = URL.createObjectURL(blob)
+                frameUrls.push(url)
+
+                const card = document.createElement('div')
+                card.className = 'frame-card'
+                const img = document.createElement('img')
+                img.src = url
+                img.alt = 'Frame ' + (i + 1)
+                const label = document.createElement('div')
+                label.className = 'label'
+                label.textContent = 'frame-' + String(i + 1).padStart(3, '0') + '.png'
+                card.appendChild(img)
+                card.appendChild(label)
+                card.onclick = () => {
+                  const a = document.createElement('a')
+                  a.download = 'frame-' + String(i + 1).padStart(3, '0') + '.png'
+                  a.href = url
+                  a.click()
+                }
+                card.style.cursor = 'pointer'
+                card.title = '点击下载此帧'
+                framesGrid.appendChild(card)
+
+                resolve()
+              }, 'image/png')
+            }
+            video.addEventListener('seeked', onSeeked)
+          })
+
+          progressFill.style.width = Math.round(((i + 1) / totalFrames) * 100) + '%'
+        }
+
+        status.style.display = 'block'
+        framesGrid.classList.add('show')
+        downloadAllBtn.classList.add('show')
+        document.getElementById('frameCount').textContent = totalFrames
+        document.getElementById('frameSize').textContent = videoW + ' x ' + videoH
+
+      } catch (err) {
+        alert('处理失败: ' + err.message)
+      }
+
+      resetButton()
+    })
+
+    downloadAllBtn.addEventListener('click', async () => {
+      if (frameBlobs.length === 0) return
+      downloadAllBtn.disabled = true
+      downloadAllBtn.textContent = '下载中...'
+
+      for (let i = 0; i < frameBlobs.length; i++) {
+        const a = document.createElement('a')
+        a.download = 'frame-' + String(i + 1).padStart(3, '0') + '.png'
+        a.href = frameUrls[i]
+        a.click()
+        await new Promise(r => setTimeout(r, 300))
+      }
+
+      downloadAllBtn.disabled = false
+      downloadAllBtn.textContent = '下载全部帧 (逐张自动下载)'
+    })
+
+    function resetButton() {
+      extractBtn.disabled = false
+      extractBtn.textContent = '提取帧并逐张导出'
+      progressBar.style.display = 'none'
+    }
+  </script>
+</body>
+</html>

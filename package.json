@@ -1,0 +1,29 @@
+{
+  "name": "roach-desktop-pet",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "description": "蟑螂桌宠 - 一个可爱的桌面宠物",
+  "author": "roach-pet",
+  "build": {
+    "productName": "蟑螂桌宠",
+    "win": {
+      "target": "portable"
+    },
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "files": [
+      "main.js",
+      "index.html",
+      "material/**/*"
+    ]
+  }
+}
