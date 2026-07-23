@@ -102,6 +102,28 @@
       animation: chew 0.22s ease-in-out infinite;
     }
 
+    /* 觅食增强动画 */
+    /* 发现食物时的兴奋跳跃 */
+    @keyframes discover-excited {
+      0%, 100% { transform: translateY(0) scale(1); }
+      25% { transform: translateY(-15px) scale(1.05); }
+      50% { transform: translateY(0) scale(0.95); }
+      75% { transform: translateY(-8px) scale(1.02); }
+    }
+    #roach-anim-wrap.anim-discover {
+      animation: discover-excited 0.6s ease-out;
+    }
+
+    /* 打嗝效果 */
+    @keyframes burp-bounce {
+      0%, 100% { transform: translateY(0) scale(1); }
+      30% { transform: translateY(-5px) scale(1.08); }
+      60% { transform: translateY(2px) scale(0.95); }
+    }
+    #roach-anim-wrap.anim-burp {
+      animation: burp-bounce 0.3s ease-out;
+    }
+
     /* 对话气泡 */
     #bubble {
       position: absolute;
@@ -313,6 +335,12 @@
     let digesting = false      // 消化冷却中,不找新目标
     let digestTimer = 0        // 冷却剩余秒
 
+    // 觅食增强状态
+    let forageState = 'IDLE'   // IDLE | DISCOVERING | APPROACHING
+    let forageStateTimer = 0   // 当前状态计时器
+    let burpTimer = 999        // 打嗝计时器(初始设为大值,避免启动就触发)
+    let burpActive = 0         // 打嗝动画进行中
+
     function randBetween(a, b) { return a + Math.random() * (b - a) }
     function deg2rad(d) { return d * Math.PI / 180 }
 
@@ -347,6 +375,7 @@
       updateCrawl(dt, canCrawl)
       if (foraging) updateForage(dt)
       updateFrame(dt)
+      updateBurp(dt)
       requestAnimationFrame(loop)
     }
     requestAnimationFrame(loop)
@@ -498,7 +527,7 @@
       }
     }
 
-    // ========== 觅食:奔向最近桌面图标 ==========
+    // ========== 觅食:奔向最近桌面图标(增强气泡和反应) ==========
     async function refreshDesktopIcons() {
       const r = await ipcRenderer.invoke('get-desktop-icons')
       desktopIcons = (r && r.ok) ? r.items : []
@@ -513,30 +542,65 @@
         digestTimer -= dt
         if (digestTimer <= 0) {
           digesting = false
-          refreshDesktopIcons()   // 异步刷新,期间 desktopIcons 仍是旧的,无所谓
+          refreshDesktopIcons()
           if (desktopIcons.length > 0) showBubble('又饿了…')
         }
         targetDot.classList.remove('show')
         return
       }
 
-      if (desktopIcons.length === 0) { targetDot.classList.remove('show'); return }
-
-      // 无目标时挑最近的(按视觉中心距离)
-      if (!targetIcon) {
-        let best = null, bestD = Infinity
-        const rcx0 = petX + petW * CONFIG.chew.roachCenterX
-        const rcy0 = petY + petH * CONFIG.chew.roachCenterY
-        for (const ic of desktopIcons) {
-          const d = Math.hypot(ic.x + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetX - rcx0,
-                               ic.y + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetY - rcy0)
-          if (d < bestD) { bestD = d; best = ic }
-        }
-        targetIcon = best
-        if (!targetIcon) return
+      if (desktopIcons.length === 0) { 
+        forageState = 'IDLE'
+        targetDot.classList.remove('show')
+        return 
       }
 
-      // 视觉中心对齐:用蟑螂图像中心 vs 图标中心算方向和距离
+      // 状态机:觅食流程
+      switch (forageState) {
+        case 'IDLE':
+          pickNearestTarget()
+          if (targetIcon) {
+            forageState = 'DISCOVERING'
+            forageStateTimer = 0.5  // 发现食物,兴奋 0.5 秒
+            showBubble('哇！好吃的！')
+            animWrap.classList.add('anim-discover')
+            setTimeout(() => animWrap.classList.remove('anim-discover'), 600)
+          }
+          break
+
+        case 'DISCOVERING':
+          forageStateTimer -= dt
+          if (forageStateTimer <= 0) {
+            forageState = 'APPROACHING'
+          }
+          break
+
+        case 'APPROACHING':
+          approachTarget(dt)
+          break
+      }
+
+      targetDot.classList.remove('show')
+    }
+
+    function pickNearestTarget() {
+      let best = null, bestD = Infinity
+      const rcx0 = petX + petW * CONFIG.chew.roachCenterX
+      const rcy0 = petY + petH * CONFIG.chew.roachCenterY
+      for (const ic of desktopIcons) {
+        const d = Math.hypot(ic.x + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetX - rcx0,
+                             ic.y + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetY - rcy0)
+        if (d < bestD) { bestD = d; best = ic }
+      }
+      targetIcon = best
+    }
+
+    function approachTarget(dt) {
+      if (!targetIcon) {
+        forageState = 'IDLE'
+        return
+      }
+
       const rcx = petX + petW * CONFIG.chew.roachCenterX
       const rcy = petY + petH * CONFIG.chew.roachCenterY
       const icx = targetIcon.x + CONFIG.chew.iconHalf + CONFIG.chew.posOffsetX
@@ -545,7 +609,7 @@
       const dy = icy - rcy
       const dist = Math.hypot(dx, dy)
 
-      // 调试红点:显示蟑螂认为的图标中心位置
+      // 调试红点
       if (CONFIG.chew.debugDot) {
         targetDot.classList.add('show')
         targetDot.style.transform = `translate(${icx}px, ${icy}px)`
@@ -557,15 +621,73 @@
       turnActive = 0
       scareTimer = 0
       leftDashActive = 0
-      updateFacing(crawlAngle)   // 觅食时实时朝向目标,避免咀嚼时方向不对
+      updateFacing(crawlAngle)
 
+      // 应用速度
+      currentSpeed = CONFIG.crawl.baseSpeed * CONFIG.chew.huntSpeedMul
+      moveByAngle(crawlAngle, currentSpeed * dt)
+
+      // 到达判定
       if (dist < CONFIG.chew.reachDist) {
         eating = true
         eatTimer = 0
         currentSpeed = 0
         targetDot.classList.remove('show')
-        // 只有 PNG 帧素材不到位时,才用 CSS 补位动画;素材到位则由 updateChew 切帧
+        showBubble('吧唧吧唧...真香！')
         if (CONFIG.chew.count === 0) animWrap.classList.add('anim-chew')
+      }
+    }
+
+    function finishEat() {
+      animWrap.classList.remove('anim-chew')
+      targetDot.classList.remove('show')
+      const target = targetIcon
+      eating = false
+      eatTimer = 0
+      frameTimer = 0
+
+      if (!target) {
+        forageState = 'IDLE'
+        return
+      }
+
+      showBubble('好满足！')
+
+      // 真正吃掉图标
+      ipcRenderer.invoke('eat-icon', target.path).then(r => {
+        if (r && r.ok) {
+          desktopIcons = desktopIcons.filter(i => i.path !== target.path)
+        } else {
+          showBubble('啃不动…')
+        }
+      })
+
+      // 进入消化冷却
+      forageState = 'IDLE'
+      targetIcon = null
+      digesting = true
+      digestTimer = CONFIG.chew.cooldownSec + randBetween.apply(null, CONFIG.chew.cooldownJitterSec)
+      // 随机打嗝
+      if (Math.random() < 0.4) {
+        burpTimer = 0.5 + Math.random() * 0.5
+      }
+    }
+
+    // ========== 打嗝效果 ==========
+    function updateBurp(dt) {
+      if (burpActive > 0) {
+        burpActive -= dt
+        return
+      }
+
+      burpTimer -= dt
+      if (burpTimer <= 0 && burpActive <= 0) {
+        // 触发打嗝
+        burpActive = 0.3
+        animWrap.classList.add('anim-burp')
+        showBubble('嗝~')
+        setTimeout(() => animWrap.classList.remove('anim-burp'), 300)
+        burpTimer = 999  // 停止打嗝
       }
     }
 
@@ -580,29 +702,6 @@
         if (!roachImg.src.endsWith(pathSuffix)) roachImg.src = pathSuffix
       }
       if (eatTimer >= CONFIG.chew.duration) finishEat()
-    }
-
-    async function finishEat() {
-      animWrap.classList.remove('anim-chew')
-      targetDot.classList.remove('show')
-      const target = targetIcon
-      eating = false
-      eatTimer = 0
-      frameTimer = 0
-      targetIcon = null
-
-      if (!target) return
-      const r = await ipcRenderer.invoke('eat-icon', target.path)
-      if (r && r.ok) {
-        desktopIcons = desktopIcons.filter(i => i.path !== target.path)
-        showBubble('好吃！')
-        // 进入消化冷却:基础 60 秒 + 0~30 秒随机抖动
-        digesting = true
-        digestTimer = CONFIG.chew.cooldownSec +
-                      randBetween.apply(null, CONFIG.chew.cooldownJitterSec)
-      } else {
-        showBubble('啃不动…')
-      }
     }
 
     // ========== 点击穿透:鼠标进/出蟑螂矩形就切换 ==========
@@ -731,8 +830,12 @@
         desktopIcons = []
         digesting = false
         digestTimer = 0
+        forageState = 'IDLE'
+        forageStateTimer = 0
+        burpTimer = 0
+        burpActive = 0
         targetDot.classList.remove('show')
-        if (eating) {            // 关闭觅食时打断进行中的咀嚼
+        if (eating) {
           eating = false
           eatTimer = 0
           animWrap.classList.remove('anim-chew')
