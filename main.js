@@ -29,14 +29,18 @@ function uniqueTarget(dir, filename) {
   return path.join(dir, `${base}_${i}${ext}`)
 }
 
-// 找 scripts/get-desktop-icons.ps1:开发态在 __dirname,打包后(asarUnpack)在 resourcesPath
+// 找 scripts/get-desktop-icons.ps1
+// 关键:asar 内部路径对 Electron 的 fs 透明,但对 spawn 出去的 PowerShell 不透明,
+// 必须返回 app.asar.unpacked 里的真实路径,否则 PowerShell -File 会找不到文件。
 function resolvePsScript() {
-  const candidates = [
-    path.join(__dirname, 'scripts', 'get-desktop-icons.ps1'),
-    path.join(process.resourcesPath, 'app.asar.unpacked', 'scripts', 'get-desktop-icons.ps1'),
-    path.join(process.resourcesPath, 'scripts', 'get-desktop-icons.ps1')
-  ]
-  return candidates.find(p => fs.existsSync(p)) || null
+  // 打包态:__dirname 在 app.asar 内,跳过,只用 unpacked 真实路径
+  if (__dirname.includes('.asar')) {
+    const p = path.join(process.resourcesPath, 'app.asar.unpacked', 'scripts', 'get-desktop-icons.ps1')
+    return fs.existsSync(p) ? p : null
+  }
+  // 开发态
+  const dev = path.join(__dirname, 'scripts', 'get-desktop-icons.ps1')
+  return fs.existsSync(dev) ? dev : null
 }
 
 function createWindow() {
